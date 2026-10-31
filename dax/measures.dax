@@ -1,0 +1,147 @@
+// =============================================================================
+// measures.dax: DAX measures for the Sales Funnel & Lead-Source dashboard
+//
+// Model:
+//   leads            one flat table, loaded from data/leads_clean.csv
+//   Calendar         date table (step 0)
+//   Funnel Stages    small helper table that drives the funnel visual (step 0)
+//
+// Reconciliation: with no filters applied, every measure should return the value
+// written beside it. These are the same numbers as the SQL in sql/02_analysis.sql.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// 0. One-time model setup
+// -----------------------------------------------------------------------------
+// In Power Query set column types: the five *_date columns = Date,
+// quoted_value and deal_value = Fixed decimal number, everything else = Text.
+//
+// Calendar table (Modeling > New table):
+//
+//   Calendar =
+//   ADDCOLUMNS (
+//       CALENDAR ( DATE ( 2025, 7, 1 ), DATE ( 2026, 12, 31 ) ),
+//       "Year",      YEAR ( [Date] ),
+//       "Month No",  MONTH ( [Date] ),
+//       "Month",     FORMAT ( [Date], "mmm yyyy" )
+//   )
+//
+// Then: Mark as date table (Date column) and sort Month by Month No.
+// Relationships (Model view):
+//   Calendar[Date] -> leads[created_date]   one-to-many, ACTIVE   (when the lead arrived)
+//   Calendar[Date] -> leads[closed_date]    one-to-many, INACTIVE (when the deal closed)
+//
+// Funnel Stages (Home > Enter data), sorted by Order:
+//   Stage        Order
+//   Leads        1
+//   Qualified    2
+//   Proposal     3
+//   Negotiation  4
+//   Won          5
+
+
+// -----------------------------------------------------------------------------
+// 1. Funnel counts
+// -----------------------------------------------------------------------------
+
+Total Leads       = COUNTROWS ( leads )                          // 2,000
+Qualified Leads   = COUNT ( leads[qualified_date] )              // 1,102
+Proposals Sent    = COUNT ( leads[proposal_date] )               // 612
+Negotiations      = COUNT ( leads[negotiation_date] )            // 361
+Won Deals         = CALCULATE ( COUNTROWS ( leads ), leads[status] = "Won" )    // 210
+Lost Deals        = CALCULATE ( COUNTROWS ( leads ), leads[status] = "Lost" )   // 1,688
+Open Leads        = CALCULATE ( COUNTROWS ( leads ), leads[status] = "Open" )   // 102
+
+// Won + Lost. Open leads are left out because they have not had the chance to close.
+Closed Deals      = [Won Deals] + [Lost Deals]                   // 1,898
+
+// Value shown for each row of the Funnel Stages table in the funnel visual.
+Funnel Count =
+SWITCH (
+    SELECTEDVALUE ( 'Funnel Stages'[Stage] ),
+    "Leads",       [Total Leads],
+    "Qualified",   [Qualified Leads],
+    "Proposal",    [Proposals Sent],
+    "Negotiation", [Negotiations],
+    "Won",         [Won Deals]
+)
+
+
+// -----------------------------------------------------------------------------
+// 2. Conversion rates
+// -----------------------------------------------------------------------------
+// DIVIDE returns blank instead of an error when the denominator is zero.
+
+Win Rate                = DIVIDE ( [Won Deals], [Closed Deals] )              // 11.1%
+Lead to Qualified %     = DIVIDE ( [Qualified Leads], [Total Leads] )         // 55.1%
+Qualified to Proposal % = DIVIDE ( [Proposals Sent], [Qualified Leads] )      // 55.5%
+Proposal to Negotiation % = DIVIDE ( [Negotiations], [Proposals Sent] )       // 59.0%
+Negotiation to Won %    = DIVIDE ( [Won Deals], [Negotiations] )              // 58.2%
+
+
+// -----------------------------------------------------------------------------
+// 3. Revenue
+// -----------------------------------------------------------------------------
+// deal_value is filled only for won deals, so a plain SUM is the won revenue.
+
+Revenue         = SUM ( leads[deal_value] )                      // 1,363,900
+Avg Deal Value  = DIVIDE ( [Revenue], [Won Deals] )              // 6,495
+Revenue per Lead = DIVIDE ( [Revenue], [Total Leads] )           // 682
+
+// Share of the revenue in the current selection (keeps slicers, ignores the visual's own grouping).
+Revenue Share % =
+DIVIDE ( [Revenue], CALCULATE ( [Revenue], ALLSELECTED ( leads[lead_source] ) ) )   // Referral 25.2%
+
+// Revenue by the month the deal was WON, using the inactive relationship from step 0.
+Revenue by Close Month =
+CALCULATE ( [Revenue], USERELATIONSHIP ( 'Calendar'[Date], leads[closed_date] ) )
+
+// Running total of revenue by close month.
+Revenue Running Total =
+CALCULATE (
+    [Revenue by Close Month],
+    FILTER ( ALL ( 'Calendar'[Date] ), 'Calendar'[Date] <= MAX ( 'Calendar'[Date] ) )
+)
+
+
+// -----------------------------------------------------------------------------
+// 4. Sales cycle and quotes
+// -----------------------------------------------------------------------------
+
+// Average days from lead creation to win (won deals only).
+Avg Sales Cycle (Days) =
+CALCULATE (
+    AVERAGEX ( leads, DATEDIFF ( leads[created_date], leads[closed_date], DAY ) ),
+    leads[status] = "Won"
+)                                                                 // 39.8
+
+// Average days spent between negotiation and close (the slowest step).
+Avg Negotiation Days =
+CALCULATE (
+    AVERAGEX ( leads, DATEDIFF ( leads[negotiation_date], leads[closed_date], DAY ) ),
+    leads[status] = "Won"
+)                                                                 // 20.2
+
+Quoted Value (Won) = CALCULATE ( SUM ( leads[quoted_value] ), leads[status] = "Won" )
+
+// How far won deals ended up below the quoted price.
+Discount from Quote % = 1 - DIVIDE ( [Revenue], [Quoted Value (Won)] )   // 7.7%
+
+// Quoted value of leads still in progress.
+Open Pipeline Value = CALCULATE ( SUM ( leads[quoted_value] ), leads[status] = "Open" )   // 285,300
+
+
+// -----------------------------------------------------------------------------
+// 5. Ranking and labels
+// -----------------------------------------------------------------------------
+
+// Rank of each source by revenue per lead (use in a visual by lead_source).
+Source Rank =
+RANKX ( ALLSELECTED ( leads[lead_source] ), [Revenue per Lead], , DESC, DENSE )   // Referral = 1
+
+// Text for a card or title that follows the slicers.
+Selection Summary =
+FORMAT ( [Total Leads], "#,0" ) & " leads  |  "
+    & FORMAT ( [Win Rate], "0.0%" ) & " win rate  |  "
+    & FORMAT ( [Revenue] / 1000, "$#,0" ) & "K revenue"
